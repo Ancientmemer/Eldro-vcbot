@@ -1,156 +1,238 @@
-import asyncio
-from pyrogram import Client, filters
-from pyrogram.types import Message
-from pytgcalls import PyTgCalls
-from pytgcalls.types.input_stream import InputAudioStream, InputVideoStream, InputStream
-from pytgcalls.types.input_stream.quality import HighQualityAudio, LowQualityVideo
-from yt_dlp import YoutubeDL
+# main.py
+# Fixed + hardened userbot main file
+# Requirements: pyrogram, pytgcalls, yt_dlp, python-dotenv (optional)
+# Recommended tested versions (approx):
+#   pyrogram >= 2.0.0
+#   pytgcalls >= 2.2.x  (or whichever matches pyrogram)
+#   yt-dlp latest
+#
+# If you get import errors related to pytgcalls InputStream, install
+# compatible pytgcalls for your pyrogram version, or see the error messages below.
+
 import os
+import asyncio
+from typing import Optional
+from pyrogram import Client, filters, idle
+from pyrogram.types import Message
 
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-SESSION = os.getenv("SESSION")
+# load env (optional: you can use python-dotenv in docker or set envs directly)
+API_ID = int(os.getenv("API_ID") or 0)
+API_HASH = os.getenv("API_HASH") or ""
+SESSION = os.getenv("SESSION") or None   # string session
+OWNER_ID = os.getenv("OWNER_ID") or None
 
-# Add your Telegram ID here:
-SUDO_USERS = [int(os.getenv("OWNER_ID"))]
+if not API_ID or not API_HASH or not SESSION or not OWNER_ID:
+    raise RuntimeError(
+        "Missing required environment variables. Please set API_ID, API_HASH, SESSION (string session), OWNER_ID."
+    )
 
-app = Client("userbot", api_id=API_ID, api_hash=API_HASH, session_string=SESSION)
-call = PyTgCalls(app)
+SUDO_USERS = [int(OWNER_ID)]
 
-QUEUE = {}   # {chat_id: [tracks]}
+# IMPORTANT: use named params so pyrogram does not interpret your string as session filename
+app = Client(name="userbot", api_id=API_ID, api_hash=API_HASH, session_string=SESSION)
+
+# Try to import pytgcalls and input stream classes. If not available or import path changed,
+# keep the bot running but disable VC features with helpful error messages.
+PYCALLS_AVAILABLE = True
+try:
+    from pytgcalls import PyTgCalls
+    # Input stream imports might be located differently across versions. Try common locations.
+    try:
+        from pytgcalls.types.input_stream import InputAudioStream, InputVideoStream, InputStream
+        from pytgcalls.types.input_stream.quality import HighQualityAudio, LowQualityVideo
+    except Exception:
+        # fallback import attempt for older/newer variants
+        try:
+            # some versions use pytgcalls.types.input_streams
+            from pytgcalls.types.input_streams import InputAudioStream, InputVideoStream, InputStream
+            from pytgcalls.types.input_streams.quality import HighQualityAudio, LowQualityVideo
+        except Exception:
+            # If we still can't import, mark not available and capture exception message
+            raise
+    call = PyTgCalls(app)
+except Exception as e:
+    PYCALLS_AVAILABLE = False
+    _pytgcalls_import_error = e
+    call = None  # fallback; code will check PYCALLS_AVAILABLE before using
+
+# yt-dlp options (480p video max)
+from yt_dlp import YoutubeDL
 
 ydl_opts = {
     "format": "best[height<=480]/best",
     "quiet": True,
+    "nocheckcertificate": True,
 }
 
+# Simple in-memory queue: {chat_id: [track_dict, ...]}
+QUEUE = {}  # chat_id -> list(dict) where dict = {"type": "audio"|"video", "file": path|None, "url": url|None, "title": optional}
 
-def add_to_queue(chat_id, track):
-    if chat_id not in QUEUE:
-        QUEUE[chat_id] = []
-    QUEUE[chat_id].append(track)
+def add_to_queue(chat_id: int, track: dict):
+    QUEUE.setdefault(chat_id, []).append(track)
 
-
-def get_next(chat_id):
-    if chat_id in QUEUE and QUEUE[chat_id]:
-        return QUEUE[chat_id].pop(0)
+def get_next(chat_id: int) -> Optional[dict]:
+    lst = QUEUE.get(chat_id) or []
+    if lst:
+        return lst.pop(0)
     return None
 
+# Helpers
+def is_sudo(user_id: int) -> bool:
+    return int(user_id) in SUDO_USERS
 
-# ------------------------------
-# STARTUP
-# ------------------------------
+# -------------------------
+# Commands: .play .vplay .skip .playlists
+# -------------------------
 
-@app.on_message(filters.command("play", ".") & filters.user(SUDO_USERS))
-async def play_cmd(_, message: Message):
+@Client.on_message(app, filters.command("play", ".") & filters.user(SUDO_USERS))
+async def cmd_play(client: Client, message: Message):
+    # .play [url]  OR reply to audio/video
     reply = message.reply_to_message
+    chat_id = message.chat.id
 
     if not reply and len(message.command) == 1:
-        return await message.reply("Reply to an audio/video file or give a YouTube link.")
-
-    chat_id = message.chat.id
+        return await message.reply("Reply to an audio/video file or give a YouTube link. Example: .play <youtube_url>")
 
     if reply and reply.audio:
-        file = await reply.download()
-        add_to_queue(chat_id, {"type": "audio", "file": file})
-        await message.reply("Added to queue 🎵")
+        path = await reply.download()
+        add_to_queue(chat_id, {"type": "audio", "file": path})
+        await message.reply("Added audio to queue 🎵")
     elif reply and reply.video:
-        file = await reply.download()
-        add_to_queue(chat_id, {"type": "video", "file": file})
-        await message.reply("Added to queue 🎥")
+        path = await reply.download()
+        add_to_queue(chat_id, {"type": "video", "file": path})
+        await message.reply("Added video to queue 🎥")
     else:
-        link = message.text.split(" ", 1)[1]
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(link, download=False)
-            url = info["url"]
-            is_video = "height" in info
+        # link passed
+        try:
+            link = message.text.split(" ", 1)[1].strip()
+        except IndexError:
+            return await message.reply("Provide a YouTube link after .play or reply to a file.")
+        try:
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(link, download=False)
+                url = info.get("url")
+                is_video = "height" in info or info.get("vcodec") is not None or info.get("acodec") is not None and info.get("width")
+                # safer: check 'height' or 'format' to guess video
+                add_to_queue(chat_id, {"type": "video" if is_video else "audio", "url": url, "title": info.get("title")})
+                await message.reply(f"Added to queue ▶️\nTitle: {info.get('title')}")
+        except Exception as ex:
+            return await message.reply(f"Failed to extract video info: {ex}")
 
-        add_to_queue(chat_id, {"type": "video" if is_video else "audio", "url": url})
-        await message.reply("Added to queue ▶️")
+    # start stream if nothing playing
+    if PYCALLS_AVAILABLE:
+        try:
+            # if no active call for this chat, start streaming
+            if not call.get_call(chat_id):
+                await start_stream(chat_id, message)
+        except Exception as ex:
+            await message.reply(f"Cannot start VC stream: {ex}")
+    else:
+        await message.reply("VC streaming is not available on this instance (pytgcalls import failed).")
 
-    if not call.get_call(chat_id):
-        await start_stream(chat_id, message)
-
-
-@app.on_message(filters.command("vplay", ".") & filters.user(SUDO_USERS))
-async def vplay_cmd(_, message: Message):
+@Client.on_message(app, filters.command("vplay", ".") & filters.user(SUDO_USERS))
+async def cmd_vplay(client: Client, message: Message):
     reply = message.reply_to_message
-
-    if not reply and len(message.command) == 1:
-        return await message.reply("Reply to a video file or give a YouTube link.")
-
     chat_id = message.chat.id
 
+    if not reply and len(message.command) == 1:
+        return await message.reply("Reply to a video file or give a YouTube link. Example: .vplay <youtube_url>")
+
     if reply and reply.video:
-        file = await reply.download()
-        add_to_queue(chat_id, {"type": "video", "file": file})
-        await message.reply("Video added 🎥")
+        path = await reply.download()
+        add_to_queue(chat_id, {"type": "video", "file": path})
+        await message.reply("Video file added to queue 🎥")
     else:
-        link = message.text.split(" ", 1)[1]
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(link, download=False)
-            url = info["url"]
+        try:
+            link = message.text.split(" ", 1)[1].strip()
+        except IndexError:
+            return await message.reply("Provide a YouTube link after .vplay or reply to a video file.")
+        try:
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(link, download=False)
+                url = info.get("url")
+                add_to_queue(chat_id, {"type": "video", "url": url, "title": info.get("title")})
+                await message.reply(f"Added video to queue ▶️\nTitle: {info.get('title')}")
+        except Exception as ex:
+            return await message.reply(f"Failed to extract video info: {ex}")
 
-        add_to_queue(chat_id, {"type": "video", "url": url})
-        await message.reply("Video added ▶️")
+    if PYCALLS_AVAILABLE:
+        try:
+            if not call.get_call(chat_id):
+                await start_stream(chat_id, message)
+        except Exception as ex:
+            await message.reply(f"Cannot start VC stream: {ex}")
+    else:
+        await message.reply("VC streaming is not available on this instance (pytgcalls import failed).")
 
-    if not call.get_call(chat_id):
-        await start_stream(chat_id, message)
+async def start_stream(chat_id: int, message: Message):
+    if not PYCALLS_AVAILABLE:
+        return await message.reply("VC streaming not available here. (pytgcalls import failed).")
 
-
-async def start_stream(chat_id, message):
     track = get_next(chat_id)
     if not track:
-        return await message.reply("Queue empty.")
+        return await message.reply("Queue empty. Nothing to play.")
 
-    stream = None
-
-    if track["type"] == "audio":
-        source = track.get("file") or track.get("url")
-        stream = InputStream(InputAudioStream(source, HighQualityAudio()))
-    else:
-        source = track.get("file") or track.get("url")
-        stream = InputStream(
-            InputVideoStream(source, LowQualityVideo()),  # 480p
-            InputAudioStream(source, HighQualityAudio())
-        )
-
-    await call.join_group_call(chat_id, stream)
-    await message.reply("Streaming started 🔥")
-
-
-@call.on_stream_end()
-async def stream_end_handler(_, update):
-    chat_id = update.chat_id
-    next_track = get_next(chat_id)
-
-    if next_track:
-        source = next_track.get("file") or next_track.get("url")
-
-        if next_track["type"] == "audio":
+    # build stream based on track type
+    try:
+        if track["type"] == "audio":
+            source = track.get("file") or track.get("url")
             stream = InputStream(InputAudioStream(source, HighQualityAudio()))
         else:
+            source = track.get("file") or track.get("url")
             stream = InputStream(
-                InputVideoStream(source, LowQualityVideo()),
+                InputVideoStream(source, LowQualityVideo()),  # LowQualityVideo ~ 480p
                 InputAudioStream(source, HighQualityAudio())
             )
 
-        await call.change_stream(chat_id, stream)
-    else:
-        await call.leave_group_call(chat_id)
+        await call.join_group_call(chat_id, stream)
+        await message.reply("Streaming started 🔥")
+    except Exception as ex:
+        await message.reply(f"Failed to start stream: {ex}")
 
+# handle when stream ends (pytgcalls callback)
+if PYCALLS_AVAILABLE:
+    try:
+        @call.on_stream_end()
+        async def _on_stream_end(_, update):
+            chat_id = update.chat_id
+            next_track = get_next(chat_id)
+            if not next_track:
+                try:
+                    await call.leave_group_call(chat_id)
+                except:
+                    pass
+                return
 
-@app.on_message(filters.command("skip", ".") & filters.user(SUDO_USERS))
-async def skip(_, message):
+            source = next_track.get("file") or next_track.get("url")
+            if next_track["type"] == "audio":
+                stream = InputStream(InputAudioStream(source, HighQualityAudio()))
+            else:
+                stream = InputStream(
+                    InputVideoStream(source, LowQualityVideo()),
+                    InputAudioStream(source, HighQualityAudio())
+                )
+            await call.change_stream(chat_id, stream)
+    except Exception as e:
+        # if the callback API changed, log error but continue
+        print("Warning: failed to register on_stream_end callback:", e)
+
+@Client.on_message(app, filters.command("skip", ".") & filters.user(SUDO_USERS))
+async def cmd_skip(client: Client, message: Message):
     chat_id = message.chat.id
     next_track = get_next(chat_id)
 
     if not next_track:
-        await call.leave_group_call(chat_id)
+        if PYCALLS_AVAILABLE:
+            try:
+                await call.leave_group_call(chat_id)
+            except Exception:
+                pass
         return await message.reply("Queue empty. Disconnected.")
 
-    source = next_track.get("file") or next_track.get("url")
+    if not PYCALLS_AVAILABLE:
+        return await message.reply("VC streaming not available here. Cannot skip.")
 
+    source = next_track.get("file") or next_track.get("url")
     if next_track["type"] == "audio":
         stream = InputStream(InputAudioStream(source, HighQualityAudio()))
     else:
@@ -159,32 +241,56 @@ async def skip(_, message):
             InputAudioStream(source, HighQualityAudio())
         )
 
-    await call.change_stream(chat_id, stream)
-    await message.reply("Skipped ⏭")
+    try:
+        await call.change_stream(chat_id, stream)
+        await message.reply("Skipped ⏭")
+    except Exception as ex:
+        await message.reply(f"Failed to skip: {ex}")
 
-
-@app.on_message(filters.command("playlists", ".") & filters.user(SUDO_USERS))
-async def playlist(_, message):
+@Client.on_message(app, filters.command("playlists", ".") & filters.user(SUDO_USERS))
+async def cmd_playlists(client: Client, message: Message):
     chat_id = message.chat.id
-
-    if chat_id not in QUEUE or not QUEUE[chat_id]:
+    q = QUEUE.get(chat_id) or []
+    if not q:
         return await message.reply("Queue is empty.")
-
     text = "**Current Queue:**\n"
-    for i, track in enumerate(QUEUE[chat_id], start=1):
-        ttype = "🎥 Video" if track["type"] == "video" else "🎵 Audio"
-        text += f"{i}. {ttype}\n"
-
+    for i, t in enumerate(q, start=1):
+        ttype = "🎥 Video" if t.get("type") == "video" else "🎵 Audio"
+        title = t.get("title") or (t.get("file") and os.path.basename(t.get("file"))) or t.get("url") or "Unknown"
+        text += f"{i}. {ttype} — {title}\n"
     await message.reply(text)
 
+# startup / shutdown
+async def start_services():
+    print("Starting userbot...")
+    await app.start()
+    if PYCALLS_AVAILABLE:
+        try:
+            await call.start()
+        except Exception as e:
+            print("Failed to start pytgcalls:", e)
+    else:
+        print("pytgcalls not available:", _pytgcalls_import_error)
+
+async def stop_services():
+    print("Stopping userbot...")
+    try:
+        if PYCALLS_AVAILABLE:
+            await call.stop()
+    except:
+        pass
+    try:
+        await app.stop()
+    except:
+        pass
 
 async def main():
-    print("Userbot Starting...")
-    await app.start()
-    await call.start()
-    print("Userbot ready!")
-    await idle()
-
+    await start_services()
+    print("Userbot ready.")
+    try:
+        await idle()
+    finally:
+        await stop_services()
 
 if __name__ == "__main__":
     asyncio.run(main())
