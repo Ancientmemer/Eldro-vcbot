@@ -1,189 +1,190 @@
-# main.py
-import os
 import asyncio
-import logging
-from pathlib import Path
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from pytgcalls import PyTgCalls, idle
+from pytgcalls import PyTgCalls
 from pytgcalls.types.input_stream import InputAudioStream, InputVideoStream, InputStream
-from pytgcalls.types.input_stream.quality import HighQualityAudio, HighQualityVideo
-import yt_dlp
+from pytgcalls.types.input_stream.quality import HighQualityAudio, LowQualityVideo
+from yt_dlp import YoutubeDL
+import os
 
-# =============== CONFIG ===============
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
-SESSION_STRING = os.getenv("SESSION_STRING")
-SUDO_USERS = [int(x) for x in os.getenv("SUDO_USERS", "").split()]
+SESSION = os.getenv("SESSION")
 
-# short safe session path (important!)
-Path("sessions").mkdir(exist_ok=True)
-SESSION_NAME = "sessions/userbot"
+# Add your Telegram ID here:
+SUDO_USERS = [int(os.getenv("OWNER_ID"))]
 
-# =============== LOGGING ===============
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-log = logging.getLogger("VCUserbot")
-
-# =============== PYROGRAM CLIENT ===============
-app = Client(
-    SESSION_NAME,
-    api_id=API_ID,
-    api_hash=API_HASH,
-    session_string=SESSION_STRING
-)
-
-# =============== VC CLIENT ===============
+app = Client("userbot", api_id=API_ID, api_hash=API_HASH, session_string=SESSION)
 call = PyTgCalls(app)
 
-queue = {}  # {chat_id: [ {type, file, title} ] }
+QUEUE = {}   # {chat_id: [tracks]}
 
-# ---------------------------------------------------
-# Helper: Check sudo
-# ---------------------------------------------------
-def is_sudo(user_id):
-    return user_id in SUDO_USERS
+ydl_opts = {
+    "format": "best[height<=480]/best",
+    "quiet": True,
+}
 
-# ---------------------------------------------------
-# Helper: Download audio/video using yt-dlp
-# ---------------------------------------------------
-async def download_media(url, is_video=False):
-    ydl_opts = {
-        "format": "bestvideo+bestaudio/best" if is_video else "bestaudio/best",
-        "outtmpl": "downloads/%(title)s.%(ext)s",
-        "quiet": True,
-    }
 
-    Path("downloads").mkdir(exist_ok=True)
+def add_to_queue(chat_id, track):
+    if chat_id not in QUEUE:
+        QUEUE[chat_id] = []
+    QUEUE[chat_id].append(track)
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        file_path = ydl.prepare_filename(info)
-        return file_path, info.get("title", "Unknown")
 
-# ---------------------------------------------------
-# Play next in queue
-# ---------------------------------------------------
-async def play_next(chat_id):
-    if chat_id not in queue or len(queue[chat_id]) == 0:
-        await call.leave_group_call(chat_id)
-        return
+def get_next(chat_id):
+    if chat_id in QUEUE and QUEUE[chat_id]:
+        return QUEUE[chat_id].pop(0)
+    return None
 
-    track = queue[chat_id].pop(0)
+
+# ------------------------------
+# STARTUP
+# ------------------------------
+
+@app.on_message(filters.command("play", ".") & filters.user(SUDO_USERS))
+async def play_cmd(_, message: Message):
+    reply = message.reply_to_message
+
+    if not reply and len(message.command) == 1:
+        return await message.reply("Reply to an audio/video file or give a YouTube link.")
+
+    chat_id = message.chat.id
+
+    if reply and reply.audio:
+        file = await reply.download()
+        add_to_queue(chat_id, {"type": "audio", "file": file})
+        await message.reply("Added to queue 🎵")
+    elif reply and reply.video:
+        file = await reply.download()
+        add_to_queue(chat_id, {"type": "video", "file": file})
+        await message.reply("Added to queue 🎥")
+    else:
+        link = message.text.split(" ", 1)[1]
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(link, download=False)
+            url = info["url"]
+            is_video = "height" in info
+
+        add_to_queue(chat_id, {"type": "video" if is_video else "audio", "url": url})
+        await message.reply("Added to queue ▶️")
+
+    if not call.get_call(chat_id):
+        await start_stream(chat_id, message)
+
+
+@app.on_message(filters.command("vplay", ".") & filters.user(SUDO_USERS))
+async def vplay_cmd(_, message: Message):
+    reply = message.reply_to_message
+
+    if not reply and len(message.command) == 1:
+        return await message.reply("Reply to a video file or give a YouTube link.")
+
+    chat_id = message.chat.id
+
+    if reply and reply.video:
+        file = await reply.download()
+        add_to_queue(chat_id, {"type": "video", "file": file})
+        await message.reply("Video added 🎥")
+    else:
+        link = message.text.split(" ", 1)[1]
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(link, download=False)
+            url = info["url"]
+
+        add_to_queue(chat_id, {"type": "video", "url": url})
+        await message.reply("Video added ▶️")
+
+    if not call.get_call(chat_id):
+        await start_stream(chat_id, message)
+
+
+async def start_stream(chat_id, message):
+    track = get_next(chat_id)
+    if not track:
+        return await message.reply("Queue empty.")
+
+    stream = None
 
     if track["type"] == "audio":
-        await call.join_group_call(
-            chat_id,
-            InputStream(
-                InputAudioStream(
-                    track["file"],
-                    HighQualityAudio()
-                )
-            )
-        )
+        source = track.get("file") or track.get("url")
+        stream = InputStream(InputAudioStream(source, HighQualityAudio()))
     else:
-        await call.join_group_call(
-            chat_id,
-            InputStream(
-                InputAudioStream(track["file"], HighQualityAudio()),
-                InputVideoStream(track["file"], HighQualityVideo())
-            )
+        source = track.get("file") or track.get("url")
+        stream = InputStream(
+            InputVideoStream(source, LowQualityVideo()),  # 480p
+            InputAudioStream(source, HighQualityAudio())
         )
 
-# ---------------------------------------------------
-# COMMANDS
-# ---------------------------------------------------
+    await call.join_group_call(chat_id, stream)
+    await message.reply("Streaming started 🔥")
 
-# .play — play audio
-@app.on_message(filters.me & filters.command("play", "."))
-async def play_cmd(client: Client, msg: Message):
-    if not is_sudo(msg.from_user.id):
-        return await msg.reply("Not allowed ❌")
 
-    chat_id = msg.chat.id
-
-    if msg.reply_to_message and msg.reply_to_message.audio:
-        file = await msg.reply_to_message.download()
-        title = msg.reply_to_message.audio.file_name
-    else:
-        url = msg.text.split(maxsplit=1)[1]
-        file, title = await download_media(url, is_video=False)
-
-    if chat_id not in queue:
-        queue[chat_id] = []
-
-    queue[chat_id].append({"type": "audio", "file": file, "title": title})
-
-    # If nothing is playing, start immediately
-    if len(queue[chat_id]) == 1:
-        await play_next(chat_id)
-
-    await msg.reply(f"🎵 Queued: **{title}**")
-
-# .vplay — play video
-@app.on_message(filters.me & filters.command("vplay", "."))
-async def vplay_cmd(client: Client, msg: Message):
-    if not is_sudo(msg.from_user.id):
-        return await msg.reply("Not allowed ❌")
-
-    chat_id = msg.chat.id
-
-    url = msg.text.split(maxsplit=1)[1]
-    file, title = await download_media(url, is_video=True)
-
-    if chat_id not in queue:
-        queue[chat_id] = []
-
-    queue[chat_id].append({"type": "video", "file": file, "title": title})
-
-    if len(queue[chat_id]) == 1:
-        await play_next(chat_id)
-
-    await msg.reply(f"📽 Queued video: **{title}**")
-
-# .skip — skip current
-@app.on_message(filters.me & filters.command("skip", "."))
-async def skip_cmd(client: Client, msg: Message):
-    if not is_sudo(msg.from_user.id):
-        return await msg.reply("Not allowed ❌")
-
-    chat_id = msg.chat.id
-    await msg.reply("⏭ Skipped")
-
-    await play_next(chat_id)
-
-# .playlists — show queue
-@app.on_message(filters.me & filters.command("playlists", "."))
-async def playlist_cmd(client: Client, msg: Message):
-    chat_id = msg.chat.id
-    if chat_id not in queue or len(queue[chat_id]) == 0:
-        return await msg.reply("😴 Queue empty")
-
-    text = "**Current Queue:**\n\n"
-    for i, track in enumerate(queue[chat_id], start=1):
-        text += f"**{i}. {track['title']}** — {track['type']}\n"
-
-    await msg.reply(text)
-
-# ---------------------------------------------------
-# Pytgcalls Handler — on stream end
-# ---------------------------------------------------
 @call.on_stream_end()
 async def stream_end_handler(_, update):
     chat_id = update.chat_id
-    await play_next(chat_id)
+    next_track = get_next(chat_id)
 
-# ---------------------------------------------------
-# START BOT
-# ---------------------------------------------------
+    if next_track:
+        source = next_track.get("file") or next_track.get("url")
+
+        if next_track["type"] == "audio":
+            stream = InputStream(InputAudioStream(source, HighQualityAudio()))
+        else:
+            stream = InputStream(
+                InputVideoStream(source, LowQualityVideo()),
+                InputAudioStream(source, HighQualityAudio())
+            )
+
+        await call.change_stream(chat_id, stream)
+    else:
+        await call.leave_group_call(chat_id)
+
+
+@app.on_message(filters.command("skip", ".") & filters.user(SUDO_USERS))
+async def skip(_, message):
+    chat_id = message.chat.id
+    next_track = get_next(chat_id)
+
+    if not next_track:
+        await call.leave_group_call(chat_id)
+        return await message.reply("Queue empty. Disconnected.")
+
+    source = next_track.get("file") or next_track.get("url")
+
+    if next_track["type"] == "audio":
+        stream = InputStream(InputAudioStream(source, HighQualityAudio()))
+    else:
+        stream = InputStream(
+            InputVideoStream(source, LowQualityVideo()),
+            InputAudioStream(source, HighQualityAudio())
+        )
+
+    await call.change_stream(chat_id, stream)
+    await message.reply("Skipped ⏭")
+
+
+@app.on_message(filters.command("playlists", ".") & filters.user(SUDO_USERS))
+async def playlist(_, message):
+    chat_id = message.chat.id
+
+    if chat_id not in QUEUE or not QUEUE[chat_id]:
+        return await message.reply("Queue is empty.")
+
+    text = "**Current Queue:**\n"
+    for i, track in enumerate(QUEUE[chat_id], start=1):
+        ttype = "🎥 Video" if track["type"] == "video" else "🎵 Audio"
+        text += f"{i}. {ttype}\n"
+
+    await message.reply(text)
+
+
 async def main():
+    print("Userbot Starting...")
     await app.start()
     await call.start()
-    print("VC Userbot started successfully!")
+    print("Userbot ready!")
     await idle()
-    await app.stop()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
