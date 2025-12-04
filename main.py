@@ -1,21 +1,12 @@
 # main.py
 # Fixed + hardened userbot main file
-# Requirements: pyrogram, pytgcalls, yt_dlp, python-dotenv (optional)
-# Recommended tested versions (approx):
-#   pyrogram >= 2.0.0
-#   pytgcalls >= 2.2.x  (or whichever matches pyrogram)
-#   yt-dlp latest
-#
-# If you get import errors related to pytgcalls InputStream, install
-# compatible pytgcalls for your pyrogram version, or see the error messages below.
-
 import os
 import asyncio
 from typing import Optional
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message
 
-# load env (optional: you can use python-dotenv in docker or set envs directly)
+# load env
 API_ID = int(os.getenv("API_ID") or 0)
 API_HASH = os.getenv("API_HASH") or ""
 SESSION = os.getenv("SESSION") or None   # string session
@@ -28,44 +19,38 @@ if not API_ID or not API_HASH or not SESSION or not OWNER_ID:
 
 SUDO_USERS = [int(OWNER_ID)]
 
-# IMPORTANT: use named params so pyrogram does not interpret your string as session filename
+# IMPORTANT: use session_string so pyrogram won't use the string as filename
 app = Client(name="userbot", api_id=API_ID, api_hash=API_HASH, session_string=SESSION)
 
-# Try to import pytgcalls and input stream classes. If not available or import path changed,
-# keep the bot running but disable VC features with helpful error messages.
+# Try to import pytgcalls and input stream classes. If fails, disable VC features
 PYCALLS_AVAILABLE = True
 try:
     from pytgcalls import PyTgCalls
-    # Input stream imports might be located differently across versions. Try common locations.
     try:
         from pytgcalls.types.input_stream import InputAudioStream, InputVideoStream, InputStream
         from pytgcalls.types.input_stream.quality import HighQualityAudio, LowQualityVideo
     except Exception:
-        # fallback import attempt for older/newer variants
         try:
-            # some versions use pytgcalls.types.input_streams
             from pytgcalls.types.input_streams import InputAudioStream, InputVideoStream, InputStream
             from pytgcalls.types.input_streams.quality import HighQualityAudio, LowQualityVideo
         except Exception:
-            # If we still can't import, mark not available and capture exception message
             raise
     call = PyTgCalls(app)
 except Exception as e:
     PYCALLS_AVAILABLE = False
     _pytgcalls_import_error = e
-    call = None  # fallback; code will check PYCALLS_AVAILABLE before using
+    call = None
 
-# yt-dlp options (480p video max)
+# yt-dlp options (480p max)
 from yt_dlp import YoutubeDL
-
 ydl_opts = {
     "format": "best[height<=480]/best",
     "quiet": True,
     "nocheckcertificate": True,
 }
 
-# Simple in-memory queue: {chat_id: [track_dict, ...]}
-QUEUE = {}  # chat_id -> list(dict) where dict = {"type": "audio"|"video", "file": path|None, "url": url|None, "title": optional}
+# in-memory queue
+QUEUE = {}
 
 def add_to_queue(chat_id: int, track: dict):
     QUEUE.setdefault(chat_id, []).append(track)
@@ -76,17 +61,12 @@ def get_next(chat_id: int) -> Optional[dict]:
         return lst.pop(0)
     return None
 
-# Helpers
 def is_sudo(user_id: int) -> bool:
     return int(user_id) in SUDO_USERS
 
-# -------------------------
-# Commands: .play .vplay .skip .playlists
-# -------------------------
-
+# Commands
 @Client.on_message(app, filters.command("play", ".") & filters.user(SUDO_USERS))
 async def cmd_play(client: Client, message: Message):
-    # .play [url]  OR reply to audio/video
     reply = message.reply_to_message
     chat_id = message.chat.id
 
@@ -102,7 +82,6 @@ async def cmd_play(client: Client, message: Message):
         add_to_queue(chat_id, {"type": "video", "file": path})
         await message.reply("Added video to queue 🎥")
     else:
-        # link passed
         try:
             link = message.text.split(" ", 1)[1].strip()
         except IndexError:
@@ -112,16 +91,13 @@ async def cmd_play(client: Client, message: Message):
                 info = ydl.extract_info(link, download=False)
                 url = info.get("url")
                 is_video = "height" in info or info.get("vcodec") is not None or info.get("acodec") is not None and info.get("width")
-                # safer: check 'height' or 'format' to guess video
                 add_to_queue(chat_id, {"type": "video" if is_video else "audio", "url": url, "title": info.get("title")})
                 await message.reply(f"Added to queue ▶️\nTitle: {info.get('title')}")
         except Exception as ex:
             return await message.reply(f"Failed to extract video info: {ex}")
 
-    # start stream if nothing playing
     if PYCALLS_AVAILABLE:
         try:
-            # if no active call for this chat, start streaming
             if not call.get_call(chat_id):
                 await start_stream(chat_id, message)
         except Exception as ex:
@@ -172,7 +148,6 @@ async def start_stream(chat_id: int, message: Message):
     if not track:
         return await message.reply("Queue empty. Nothing to play.")
 
-    # build stream based on track type
     try:
         if track["type"] == "audio":
             source = track.get("file") or track.get("url")
@@ -180,7 +155,7 @@ async def start_stream(chat_id: int, message: Message):
         else:
             source = track.get("file") or track.get("url")
             stream = InputStream(
-                InputVideoStream(source, LowQualityVideo()),  # LowQualityVideo ~ 480p
+                InputVideoStream(source, LowQualityVideo()),
                 InputAudioStream(source, HighQualityAudio())
             )
 
@@ -189,7 +164,6 @@ async def start_stream(chat_id: int, message: Message):
     except Exception as ex:
         await message.reply(f"Failed to start stream: {ex}")
 
-# handle when stream ends (pytgcalls callback)
 if PYCALLS_AVAILABLE:
     try:
         @call.on_stream_end()
@@ -213,7 +187,6 @@ if PYCALLS_AVAILABLE:
                 )
             await call.change_stream(chat_id, stream)
     except Exception as e:
-        # if the callback API changed, log error but continue
         print("Warning: failed to register on_stream_end callback:", e)
 
 @Client.on_message(app, filters.command("skip", ".") & filters.user(SUDO_USERS))
